@@ -1,0 +1,542 @@
+import { useState } from "react";
+
+const sections = [
+  {
+    id: "pre",
+    label: "Phase 1 — Pre-Cleanup Verification",
+    color: "#00B4D8",
+    icon: "🔍",
+    steps: [
+      {
+        id: "pre-1",
+        title: "Confirm Guest Deletion in Entra ID (Azure AD)",
+        detail: "Admin Center > Azure Active Directory > Users > All Users > Filter: Guest. Search for Tenant B UPNs (format: user_tenantb.com#EXT#@tenanta.onmicrosoft.com). Confirm status shows 'Deleted' or absent.",
+        mto: "Identity Admin",
+        tool: "Entra ID Portal / PowerShell: Get-AzureADUser -Filter \"UserType eq 'Guest'\"",
+      },
+      {
+        id: "pre-2",
+        title: "Export list of affected Tenant B users",
+        detail: "Compile a list of all Tenant B UPNs that were previously added as guests. This becomes your reference list for all subsequent checks.",
+        mto: "Identity Admin",
+        tool: "PowerShell / Entra ID Export",
+      },
+      {
+        id: "pre-3",
+        title: "Identify Tenant A resources that were shared",
+        detail: "Document all SharePoint sites, OneDrive folders, Teams, and mailbox permissions that were shared with the guest accounts. Needed for targeted cleanup.",
+        mto: "Identity Admin + Site Owners",
+        tool: "SharePoint Admin Center / Teams Admin Center",
+      },
+    ],
+  },
+  {
+    id: "entra",
+    label: "Phase 2 — Entra ID & Directory Objects",
+    color: "#7B2FBE",
+    icon: "🪪",
+    steps: [
+      {
+        id: "entra-1",
+        title: "Check Entra ID Deleted Users (Soft-Delete Bin)",
+        detail: "Users in the recycle bin persist for 30 days and can still appear as legacy references. Admin Center > Entra ID > Users > Deleted Users. Hard-delete any remaining Tenant B guest entries.",
+        mto: "Identity Admin",
+        tool: "Entra ID Portal | Remove-AzureADMSDeletedDirectoryObject",
+      },
+      {
+        id: "entra-2",
+        title: "Check External Identities / B2B Collaboration Settings",
+        detail: "Verify no pending invitations remain. Entra ID > External Identities > All Identity Providers > Check for stale guest invites with 'PendingAcceptance' state.",
+        mto: "Identity Admin",
+        tool: "Get-AzureADMSInvitation | Where-Object {$_.InvitedUserEmailAddress -like '*tenantb*'}",
+      },
+      {
+        id: "entra-3",
+        title: "Remove legacy Contact Objects",
+        detail: "Mail contacts (not users) for Tenant B addresses may have been auto-created and remain even after guest deletion. Entra ID > Contacts — remove all Tenant B entries.",
+        mto: "Identity Admin",
+        tool: "Get-AzureADContact | Where-Object {$_.Mail -like '*tenantb*'} | Remove-AzureADContact",
+      },
+      {
+        id: "entra-4",
+        title: "Check Group Memberships for ghost references",
+        detail: "Deleted guest accounts may still appear as members of M365 Groups, Security Groups, or Teams. Run a membership audit against your reference list.",
+        mto: "Identity Admin",
+        tool: "Get-AzureADGroupMember (loop all groups) | cross-ref UPN list",
+      },
+    ],
+  },
+  {
+    id: "exo",
+    label: "Phase 3 — Exchange Online",
+    color: "#E05C00",
+    icon: "📧",
+    steps: [
+      {
+        id: "exo-1",
+        title: "Check Exchange Online Mail Contacts",
+        detail: "Even after Entra ID deletion, EXO may retain mail contact objects. These surface as 'legacy accounts' in address resolution. Run: Get-MailContact | Where-Object {$_.ExternalEmailAddress -like '*tenantb*'} | Remove-MailContact",
+        mto: "Exchange Admin",
+        tool: "Exchange Online PowerShell (EXO v3 module)",
+      },
+      {
+        id: "exo-2",
+        title: "Check Exchange Mail Users",
+        detail: "Guest accounts with mailboxes appear as MailUser objects. Check: Get-MailUser | Where-Object {$_.ExternalEmailAddress -like '*tenantb*'}",
+        mto: "Exchange Admin",
+        tool: "Exchange Online PowerShell",
+      },
+      {
+        id: "exo-3",
+        title: "Purge from Global Address List (GAL)",
+        detail: "Legacy guest contacts may still show in the GAL/Address Book. After removing mail contacts, force an OAB update: Update-GlobalAddressList and Update-OfflineAddressBook.",
+        mto: "Exchange Admin",
+        tool: "EXO PowerShell | Update-GlobalAddressList / Update-OfflineAddressBook",
+      },
+      {
+        id: "exo-4",
+        title: "Check Shared Mailbox / Distribution List permissions",
+        detail: "Guest accounts may have been granted SendAs, FullAccess, or membership on DLs. Remove any Tenant B entries from all permission sets.",
+        mto: "Exchange Admin",
+        tool: "Get-MailboxPermission / Get-RecipientPermission / Get-DistributionGroupMember",
+      },
+      {
+        id: "exo-5",
+        title: "Check Room & Resource Calendar delegates",
+        detail: "Guests may have been added as calendar delegates or booking delegates on room mailboxes.",
+        mto: "Exchange Admin",
+        tool: "Get-CalendarProcessing -Identity <room> | Select-Object BookingDelegates",
+      },
+    ],
+  },
+  {
+    id: "spo",
+    label: "Phase 4 — SharePoint Online & OneDrive",
+    color: "#0D7C3D",
+    icon: "📁",
+    steps: [
+      {
+        id: "spo-1",
+        title: "Remove Guest Access from SharePoint Sites",
+        detail: "SPO Admin Center > Active Sites > Select each site > Settings > Site Permissions > External Users. Remove all Tenant B guest entries. Or bulk via PnP PowerShell.",
+        mto: "SharePoint Admin",
+        tool: "PnP PowerShell: Get-PnPSiteCollectionAdmin / Remove-PnPUser",
+      },
+      {
+        id: "spo-2",
+        title: "Check Site Collection User Information Lists",
+        detail: "SharePoint maintains a hidden User Information List per site that can retain deleted guest profiles. These cause 'user not found' errors. Clear via: Remove-PnPUser -Identity <guest UPN> -Force on each site.",
+        mto: "SharePoint Admin",
+        tool: "PnP PowerShell: Remove-PnPUser | Site: /_layouts/15/people.aspx?MembershipGroupId=0",
+      },
+      {
+        id: "spo-3",
+        title: "Audit Shared Links (Anyone / Specific People links)",
+        detail: "Tenant B users may have active 'Specific People' sharing links. Revoke these from the document library or via SPO Admin > Policies > Sharing.",
+        mto: "SharePoint Admin / Site Owners",
+        tool: "SPO Admin Center > Reports > Sharing | PnP: Get-PnPListItem with sharing info",
+      },
+      {
+        id: "spo-4",
+        title: "Check OneDrive for Business external shares",
+        detail: "Individual user OneDrives may have shared folders/files directly with Tenant B guests. SPO Admin > OneDrive > Sharing report or run a compliance report.",
+        mto: "SharePoint Admin",
+        tool: "SPO Admin Center > OneDrive > Active Sites | Purview Compliance Center",
+      },
+    ],
+  },
+  {
+    id: "teams",
+    label: "Phase 5 — Microsoft Teams",
+    color: "#5558AF",
+    icon: "💬",
+    steps: [
+      {
+        id: "teams-1",
+        title: "Remove Guests from all Teams",
+        detail: "Teams Admin Center > Teams > Manage Teams > Members tab. Filter by Guest and remove all Tenant B entries. Or: Get-Team | Get-TeamUser -Role Guest | Remove-TeamUser",
+        mto: "Teams Admin",
+        tool: "Teams Admin Center | MicrosoftTeams PowerShell module",
+      },
+      {
+        id: "teams-2",
+        title: "Check individual Channel membership",
+        detail: "Private and Shared channels can have separate guest member lists not visible in the main Teams roster. Audit each private channel individually.",
+        mto: "Teams Admin / Team Owners",
+        tool: "Teams Admin Center > Teams > [Team] > Channels | Get-TeamChannelUser",
+      },
+      {
+        id: "teams-3",
+        title: "Verify Guest Access settings post-cleanup",
+        detail: "Confirm Tenant A guest access settings align with desired cross-tenant policy. Teams Admin Center > Users > Guest Access. Ensure 'Allow guest access in Teams' reflects MTO policy.",
+        mto: "Teams Admin",
+        tool: "Teams Admin Center > Users > Guest Access",
+      },
+    ],
+  },
+  {
+    id: "purview",
+    label: "Phase 6 — Purview / Compliance",
+    color: "#B5179E",
+    icon: "🛡️",
+    steps: [
+      {
+        id: "purview-1",
+        title: "Check Microsoft Purview for guest references",
+        detail: "Compliance Center > Data Lifecycle > Retention policies / Labels — ensure Tenant B guests aren't listed as custodians or policy targets.",
+        mto: "Compliance Admin",
+        tool: "Microsoft Purview Compliance Center",
+      },
+      {
+        id: "purview-2",
+        title: "Review eDiscovery Custodian lists",
+        detail: "If any eDiscovery holds were applied to or include Tenant B guest accounts, these must be updated or released to prevent errors.",
+        mto: "Compliance Admin",
+        tool: "Purview > eDiscovery > Cases > Custodians",
+      },
+    ],
+  },
+  {
+    id: "crosstenantpost",
+    label: "Phase 7 — Cross-Tenant & Post-Cleanup Validation",
+    color: "#0077B6",
+    icon: "✅",
+    steps: [
+      {
+        id: "post-1",
+        title: "Configure Cross-Tenant Access Settings (if not already done)",
+        detail: "Entra ID > External Identities > Cross-tenant access settings. Add Tenant B as a trusted org. Configure inbound/outbound trust and MFA claim acceptance to prevent future guest account creation requirements.",
+        mto: "Identity Admin",
+        tool: "Entra ID > External Identities > Cross-tenant access settings",
+      },
+      {
+        id: "post-2",
+        title: "Test user access from Tenant B",
+        detail: "Have a Tenant B pilot user attempt to access a shared SharePoint document or Teams resource. Confirm no legacy guest errors appear. Document the result.",
+        mto: "Identity Admin + Test User",
+        tool: "Manual UAT / browser test in InPrivate session",
+      },
+      {
+        id: "post-3",
+        title: "Force AAD token refresh for affected users",
+        detail: "Tenant B users may have cached tokens referencing the old guest account. Ask users to sign out of all Microsoft apps, clear browser cache, and sign back in.",
+        mto: "Helpdesk / End User",
+        tool: "User action: Sign out > Clear cache > Re-authenticate",
+      },
+      {
+        id: "post-4",
+        title: "Monitor Sign-In Logs for residual errors",
+        detail: "Entra ID > Monitoring > Sign-In Logs — filter by Tenant B domains for 48hrs post-cleanup. Look for error codes 50020, 51004, or AADSTS errors referencing guest accounts.",
+        mto: "Identity Admin",
+        tool: "Entra ID Sign-In Logs | KQL in Sentinel if available",
+      },
+      {
+        id: "post-5",
+        title: "Document cleanup actions & close MTO ticket",
+        detail: "Record every object removed, by whom, and when. Attach PowerShell output logs. Update the MTO record with resolution steps and close ticket.",
+        mto: "Identity Admin / Change Manager",
+        tool: "MTO / ITSM Tool",
+      },
+    ],
+  },
+];
+
+export default function ChecklistApp() {
+  const [checked, setChecked] = useState({});
+  const [expanded, setExpanded] = useState({ pre: true });
+  const [notes, setNotes] = useState({});
+  const [editingNote, setEditingNote] = useState(null);
+
+  const toggle = (id) => setChecked((p) => ({ ...p, [id]: !p[id] }));
+  const toggleSection = (id) => setExpanded((p) => ({ ...p, [id]: !p[id] }));
+
+  const totalSteps = sections.reduce((a, s) => a + s.steps.length, 0);
+  const completedSteps = Object.values(checked).filter(Boolean).length;
+  const pct = Math.round((completedSteps / totalSteps) * 100);
+
+  const sectionProgress = (s) => {
+    const done = s.steps.filter((st) => checked[st.id]).length;
+    return { done, total: s.steps.length, pct: Math.round((done / s.steps.length) * 100) };
+  };
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "#0a0d14",
+      fontFamily: "'IBM Plex Mono', 'Courier New', monospace",
+      color: "#c9d1d9",
+      padding: "0 0 60px 0",
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+        * { box-sizing: border-box; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #0a0d14; }
+        ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+        .step-card { transition: all 0.18s ease; }
+        .step-card:hover { background: #161b22 !important; }
+        .check-btn { transition: all 0.15s ease; cursor: pointer; user-select: none; }
+        .check-btn:hover { transform: scale(1.08); }
+        .section-toggle { cursor: pointer; transition: background 0.15s; }
+        .section-toggle:hover { filter: brightness(1.1); }
+        .bar-fill { transition: width 0.5s cubic-bezier(.4,0,.2,1); }
+        textarea { resize: vertical; outline: none; }
+        textarea:focus { border-color: #58a6ff !important; }
+      `}</style>
+
+      {/* Header */}
+      <div style={{
+        background: "linear-gradient(135deg, #0d1117 0%, #161b22 100%)",
+        borderBottom: "1px solid #21262d",
+        padding: "32px 40px 24px",
+        position: "sticky", top: 0, zIndex: 100,
+        backdropFilter: "blur(10px)",
+      }}>
+        <div style={{ maxWidth: 900, margin: "0 auto" }}>
+          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 16 }}>
+            <div>
+              <div style={{ fontSize: 11, letterSpacing: "0.2em", color: "#58a6ff", fontWeight: 600, marginBottom: 6, textTransform: "uppercase" }}>
+                MTO · M365 Remediation Runbook
+              </div>
+              <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: "#f0f6fc", lineHeight: 1.2, fontFamily: "'IBM Plex Sans', sans-serif" }}>
+                Guest Account Legacy Cleanup
+              </h1>
+              <div style={{ fontSize: 12, color: "#8b949e", marginTop: 6 }}>
+                Tenant A ← Tenant B · Cross-tenant access remediation
+              </div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 32, fontWeight: 700, color: pct === 100 ? "#3fb950" : "#58a6ff", fontFamily: "'IBM Plex Mono'" }}>
+                {pct}%
+              </div>
+              <div style={{ fontSize: 11, color: "#8b949e" }}>{completedSteps} / {totalSteps} steps</div>
+            </div>
+          </div>
+          {/* Master progress bar */}
+          <div style={{ marginTop: 16, background: "#21262d", borderRadius: 4, height: 6, overflow: "hidden" }}>
+            <div className="bar-fill" style={{
+              height: "100%", width: `${pct}%`,
+              background: pct === 100 ? "#3fb950" : "linear-gradient(90deg, #1f6feb, #58a6ff)",
+              borderRadius: 4,
+            }} />
+          </div>
+        </div>
+      </div>
+
+      {/* Context Banner */}
+      <div style={{ maxWidth: 900, margin: "24px auto 0", padding: "0 24px" }}>
+        <div style={{
+          background: "#161b22",
+          border: "1px solid #30363d",
+          borderLeft: "3px solid #d29922",
+          borderRadius: 6,
+          padding: "14px 18px",
+          fontSize: 12,
+          color: "#8b949e",
+          lineHeight: 1.7,
+        }}>
+          <span style={{ color: "#d29922", fontWeight: 600 }}>⚠ SCENARIO: </span>
+          Tenant B users were added as guests into Tenant A for file sharing. Following deletion from Tenant A's identity, Tenant B users encounter errors referencing legacy/residual guest objects that persist across multiple M365 service planes. Work through each phase sequentially and mark steps complete as you go.
+        </div>
+      </div>
+
+      {/* Sections */}
+      <div style={{ maxWidth: 900, margin: "24px auto 0", padding: "0 24px" }}>
+        {sections.map((section) => {
+          const { done, total, pct: sPct } = sectionProgress(section);
+          const isOpen = expanded[section.id];
+          const sectionDone = done === total;
+
+          return (
+            <div key={section.id} style={{ marginBottom: 16 }}>
+              {/* Section Header */}
+              <div
+                className="section-toggle"
+                onClick={() => toggleSection(section.id)}
+                style={{
+                  background: "#161b22",
+                  border: `1px solid ${sectionDone ? "#238636" : "#30363d"}`,
+                  borderRadius: isOpen ? "6px 6px 0 0" : 6,
+                  padding: "14px 18px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 12,
+                }}
+              >
+                <span style={{ fontSize: 18 }}>{section.icon}</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: "#f0f6fc", fontFamily: "'IBM Plex Sans'" }}>
+                      {section.label}
+                    </span>
+                    {sectionDone && (
+                      <span style={{ fontSize: 10, background: "#1a4721", color: "#3fb950", padding: "2px 8px", borderRadius: 20, fontWeight: 600, letterSpacing: "0.05em" }}>
+                        COMPLETE
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 10 }}>
+                    <div style={{ flex: 1, background: "#21262d", borderRadius: 3, height: 3, overflow: "hidden", maxWidth: 200 }}>
+                      <div className="bar-fill" style={{
+                        height: "100%", width: `${sPct}%`,
+                        background: sectionDone ? "#3fb950" : section.color,
+                        borderRadius: 3,
+                      }} />
+                    </div>
+                    <span style={{ fontSize: 11, color: "#8b949e" }}>{done}/{total}</span>
+                  </div>
+                </div>
+                <span style={{ color: "#8b949e", fontSize: 14, transform: isOpen ? "rotate(180deg)" : "none", transition: "transform 0.2s" }}>▼</span>
+              </div>
+
+              {/* Steps */}
+              {isOpen && (
+                <div style={{
+                  border: "1px solid #30363d",
+                  borderTop: "none",
+                  borderRadius: "0 0 6px 6px",
+                  overflow: "hidden",
+                }}>
+                  {section.steps.map((step, idx) => {
+                    const done = checked[step.id];
+                    const isEditingNote = editingNote === step.id;
+
+                    return (
+                      <div
+                        key={step.id}
+                        className="step-card"
+                        style={{
+                          background: done ? "#0d1117" : "#0d1117",
+                          borderTop: idx > 0 ? "1px solid #21262d" : "none",
+                          padding: "16px 18px",
+                          opacity: done ? 0.7 : 1,
+                        }}
+                      >
+                        <div style={{ display: "flex", gap: 14, alignItems: "flex-start" }}>
+                          {/* Checkbox */}
+                          <div
+                            className="check-btn"
+                            onClick={() => toggle(step.id)}
+                            style={{
+                              width: 22, height: 22, borderRadius: 4, flexShrink: 0, marginTop: 2,
+                              border: `2px solid ${done ? "#3fb950" : "#30363d"}`,
+                              background: done ? "#238636" : "transparent",
+                              display: "flex", alignItems: "center", justifyContent: "center",
+                              fontSize: 13, color: "#fff",
+                            }}
+                          >
+                            {done ? "✓" : ""}
+                          </div>
+
+                          <div style={{ flex: 1 }}>
+                            {/* Step title */}
+                            <div style={{
+                              fontSize: 13, fontWeight: 600, color: done ? "#8b949e" : "#e6edf3",
+                              textDecoration: done ? "line-through" : "none",
+                              fontFamily: "'IBM Plex Sans'",
+                              marginBottom: 6,
+                            }}>
+                              {step.title}
+                            </div>
+
+                            {/* Detail */}
+                            <div style={{ fontSize: 12, color: "#8b949e", lineHeight: 1.65, marginBottom: 10 }}>
+                              {step.detail}
+                            </div>
+
+                            {/* Meta tags */}
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+                              <span style={{
+                                fontSize: 10, padding: "3px 8px", borderRadius: 20,
+                                background: "#1c2128", border: "1px solid #30363d", color: "#8b949e",
+                                letterSpacing: "0.03em",
+                              }}>
+                                👤 {step.mto}
+                              </span>
+                              <span style={{
+                                fontSize: 10, padding: "3px 8px", borderRadius: 20,
+                                background: "#1c2128", border: `1px solid ${section.color}33`, color: section.color,
+                                letterSpacing: "0.03em", fontFamily: "'IBM Plex Mono'",
+                              }}>
+                                🔧 {step.tool}
+                              </span>
+                            </div>
+
+                            {/* Notes */}
+                            <div>
+                              {!isEditingNote && !notes[step.id] && (
+                                <button
+                                  onClick={() => setEditingNote(step.id)}
+                                  style={{
+                                    background: "none", border: "1px dashed #30363d",
+                                    color: "#8b949e", fontSize: 11, padding: "4px 10px",
+                                    borderRadius: 4, cursor: "pointer",
+                                    fontFamily: "'IBM Plex Mono'",
+                                  }}
+                                >
+                                  + add note
+                                </button>
+                              )}
+                              {(isEditingNote || notes[step.id]) && (
+                                <div>
+                                  <textarea
+                                    value={notes[step.id] || ""}
+                                    onChange={(e) => setNotes((p) => ({ ...p, [step.id]: e.target.value }))}
+                                    onBlur={() => setEditingNote(null)}
+                                    onFocus={() => setEditingNote(step.id)}
+                                    placeholder="Add notes, ticket refs, findings..."
+                                    rows={2}
+                                    style={{
+                                      width: "100%", background: "#1c2128",
+                                      border: "1px solid #30363d", borderRadius: 4,
+                                      color: "#c9d1d9", fontSize: 11, padding: "8px 10px",
+                                      fontFamily: "'IBM Plex Mono'", lineHeight: 1.5,
+                                    }}
+                                  />
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Footer */}
+      <div style={{ maxWidth: 900, margin: "32px auto 0", padding: "0 24px" }}>
+        <div style={{
+          background: "#161b22", border: "1px solid #21262d",
+          borderRadius: 6, padding: "16px 20px",
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          flexWrap: "wrap", gap: 12,
+        }}>
+          <div style={{ fontSize: 11, color: "#8b949e" }}>
+            {pct === 100
+              ? "✅ All phases complete — verify with pilot user test before closing MTO"
+              : `🔄 ${totalSteps - completedSteps} steps remaining across ${sections.filter(s => sectionProgress(s).done < sectionProgress(s).total).length} phases`}
+          </div>
+          <button
+            onClick={() => {
+              setChecked({});
+              setNotes({});
+              setExpanded({ pre: true });
+            }}
+            style={{
+              background: "none", border: "1px solid #30363d",
+              color: "#8b949e", fontSize: 11, padding: "6px 14px",
+              borderRadius: 4, cursor: "pointer", fontFamily: "'IBM Plex Mono'",
+            }}
+          >
+            Reset all
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
